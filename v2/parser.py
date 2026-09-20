@@ -40,6 +40,26 @@ def sanitize_null_bytes(text: str) -> str:
     return text.replace("\x00", "") if text else text
 
 
+def sanitize_deep(obj):
+    """Strip null bytes from every string inside a nested structure.
+
+    The scalar sanitizer above only covers the columns we flatten to text. Tool
+    inputs go to JSONB whole and unflattened, so a null byte nested anywhere in
+    one reaches Postgres verbatim and the whole INSERT dies with "unsupported
+    Unicode escape sequence" — which fails the CONVERSATION, not the message, and
+    retries identically every minute forever. Found 2026-09-20: one session had
+    been failing every minute since 2026-09-15 because a tool_use input carried
+    the source of a sanitizer whose own regex literal contained \\x00.
+    """
+    if isinstance(obj, str):
+        return obj.replace("\x00", "")
+    if isinstance(obj, dict):
+        return {k: sanitize_deep(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_deep(v) for v in obj]
+    return obj
+
+
 def extract_text_content(content) -> str:
     """Extract text from a message content field.
 
@@ -86,7 +106,9 @@ def extract_tool_calls(content) -> Optional[list]:
                 "type": block.get("type"),
                 "id": block.get("id"),
                 "name": block.get("name"),
-                "input": block.get("input"),
+                # sanitize_deep, not sanitize_null_bytes: input is arbitrary nested
+                # JSON and goes to JSONB whole. See sanitize_deep's docstring.
+                "input": sanitize_deep(block.get("input")),
             })
 
     return tools if tools else None

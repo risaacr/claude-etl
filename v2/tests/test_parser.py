@@ -111,6 +111,34 @@ class TestEdgeCases:
         result = parse_conversation(null_byte)
         assert "\x00" not in (result.messages[0].content or "")
 
+    def test_null_bytes_sanitized_inside_tool_call_input(self, tmp_path):
+        """tool_use input goes to JSONB whole — a null byte NESTED in it used to
+        survive the flat sanitizer and kill the INSERT for the whole conversation.
+        """
+        f = tmp_path / "tool_null.jsonl"
+        f.write_text(json.dumps({
+            "type": "assistant",
+            "uuid": "a",
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "t1", "name": "Edit",
+                "input": {"new_string": "re.sub(r'[\x00-\x1f]', '', s)",
+                          "nested": [{"deep": "x\x00y"}]},
+            }]},
+        }) + "\n")
+        calls = parse_conversation(f).messages[0].tool_calls
+        # NOT json.dumps() — that re-escapes NUL to the six characters \\u0000, so a
+        # membership test against it is true no matter what the parser did.
+        def strings(o):
+            if isinstance(o, str):
+                yield o
+            elif isinstance(o, dict):
+                for v in o.values():
+                    yield from strings(v)
+            elif isinstance(o, list):
+                for v in o:
+                    yield from strings(v)
+        assert calls and not any("\x00" in v for v in strings(calls))
+
 
 class TestIdempotency:
     """Test that parsing the same file twice produces identical results."""
