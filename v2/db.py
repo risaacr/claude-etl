@@ -200,77 +200,75 @@ def _content_hash(content: Optional[str]) -> Optional[str]:
     return hashlib.sha256(content.encode("utf-8")).hexdigest() if content else None
 
 
-def _append_only_from(cur, conv_id: int, parsed: ParsedConversation) -> Optional[int]:
-    """Return the highest stored sequence_num IF the stored messages are a
-    provable PREFIX of `parsed`, else None.
+def _plan_message_write(
+    stored: list[tuple[Optional[int], Optional[str], Optional[str]]],
+    incoming: list[ParsedMessage],
+) -> tuple[str, int]:
+    """Decide how much of a stored conversation survives a re-ingest.
 
-    None means "take the DELETE + reinsert path" — this function must never
-    return a number on anything it has not positively verified, because the
-    caller uses it to SKIP the delete.
+    `stored` is every (sequence_num, uuid, content_hash) row currently in the
+    messages table for the conversation, in any order. Returns (mode, keep):
+    rows with sequence_num < keep are KEPT untouched, every other stored row is
+    deleted, and incoming messages with sequence_num >= keep are inserted.
 
-    Why this exists: the sync cron re-ingests a live transcript every minute,
-    and the DELETE + reinsert path rewrites every message of that session on
-    each pass. Message rows carry tool_results that run to hundreds of KB, so
-    WAL tracks BYTES OF TOAST REWRITTEN, not row count — measured 2026-08-28,
-    a 2.5 GB messages table was generating 25-33 GB of WAL per day and filling
-    the backup volume. Claude transcripts are append-only in the normal case,
-    so appending is both correct and ~95% cheaper.
+      insert     nothing stored                          keep = 0
+      unchanged  every stored row verified, same length  keep = n, nothing written
+      append     every stored row verified, file grew    keep = n
+      suffix     rows 0..keep-1 verified, rest differ    0 < keep < n
+      replace    head row does not match                 keep = 0, full rewrite
 
-    ⛔ The abnormal case is real and is why every check below is required:
-    COMPACTION REWRITES A TRANSCRIPT FROM THE HEAD. After it, the file can be
-    the same length or longer while containing entirely different messages at
-    the same sequence numbers. Verifying only the tail would step straight
-    into that. So we pin BOTH ends of the stored range by uuid and re-derived
-    content hash, and bail on anything we cannot prove.
+    A row is VERIFIED only if its uuid is present on both sides and equal AND
+    its stored content_hash equals the hash of the incoming content. `keep` is
+    the length of the run of verified rows from seq 0. This function must never
+    count a row it has not verified, because the caller skips the DELETE for it.
+
+    Why: the sync cron re-ingests a transcript whenever its BYTES change, and
+    Claude Code appends many records the parser ignores (queue-operation,
+    last-prompt, ai-title, mode, attachment, api-request...). The previous check
+    took the cheap path only when the message count GREW, so each of those
+    passes DELETEd and reinserted the whole conversation with identical
+    content — measured 2026-11-08: one 27k-message session rewritten 517 times
+    in a week, ~2.1 GB/h of WAL against the backup volume. Message rows carry
+    large TOAST values and two GIN indexes, so WAL tracks rows rewritten.
+
+    ⛔ COMPACTION REWRITES A TRANSCRIPT FROM THE HEAD. The file can be the same
+    length or longer with different messages at the same sequence numbers, so
+    a head mismatch is a full replace, and the comparison walks from the head
+    rather than trusting the tail. A duplicate or NULL stored sequence_num is
+    also a full replace: a row below the cut that we have not reasoned about
+    would otherwise survive the 'DELETE ... WHERE sequence_num >= keep'.
     """
-    cur.execute(
-        "SELECT COUNT(*), MIN(sequence_num), MAX(sequence_num) FROM messages WHERE conversation_id = %s",
-        (conv_id,),
-    )
-    stored_count, min_seq, max_seq = cur.fetchone()
+    if not stored:
+        return ("insert", 0)
 
-    # Nothing stored: no prefix to extend. (The DELETE is a no-op anyway.)
-    if not stored_count:
-        return None
+    seqs = [row[0] for row in stored]
+    if any(s is None for s in seqs) or len(set(seqs)) != len(seqs):
+        return ("replace", 0)
 
-    # The file shrank, or is unchanged in length. Either way this is not an
-    # append, and "unchanged" still needs the full path so an in-place edit
-    # cannot survive as a stale row.
-    if parsed.message_count <= stored_count:
-        return None
+    # Index incoming by sequence_num so the comparison does not assume list
+    # position equals sequence.
+    by_seq = {m.sequence_num: m for m in incoming}
 
-    # Require a contiguous stored range. A gap means something already
-    # diverged from a clean prefix and we should not reason about offsets.
-    if min_seq is None or max_seq is None or (max_seq - min_seq + 1) != stored_count:
-        return None
-
-    # Index the incoming messages by sequence_num so the comparison does not
-    # assume list position equals sequence.
-    incoming = {m.sequence_num: m for m in parsed.messages}
-
-    cur.execute(
-        "SELECT sequence_num, uuid, content_hash FROM messages "
-        "WHERE conversation_id = %s AND sequence_num IN (%s, %s)",
-        (conv_id, min_seq, max_seq),
-    )
-    boundaries = cur.fetchall()
-    if len(boundaries) != len({min_seq, max_seq}):
-        return None
-
-    for seq, stored_uuid, stored_hash in boundaries:
-        msg = incoming.get(seq)
+    keep = 0
+    for seq, stored_uuid, stored_hash in sorted(stored, key=lambda r: r[0]):
+        if seq != keep:
+            break  # gap, or a range that does not start at 0
+        msg = by_seq.get(seq)
         if msg is None:
-            return None
-        # uuid is the strong identity. Without one on BOTH sides we decline —
-        # a missing uuid must not read as a match.
+            break
         if not stored_uuid or not msg.uuid or stored_uuid != msg.uuid:
-            return None
-        # Content must be byte-identical too, so an in-place edit that kept the
-        # uuid still falls back to the full rewrite.
+            break
         if stored_hash != _content_hash(msg.content):
-            return None
+            break
+        keep += 1
 
-    return max_seq
+    if keep == 0:
+        return ("replace", 0)
+    if keep < len(stored):
+        return ("suffix", keep)
+    if len(incoming) > keep:
+        return ("append", keep)
+    return ("unchanged", keep)
 
 
 def upsert_conversation(
@@ -284,16 +282,15 @@ def upsert_conversation(
     is_subagent: bool = False,
     parent_session_id: Optional[str] = None,
 ):
-    """Insert or replace a conversation and all its messages.
+    """Insert or update a conversation and its messages, in one transaction.
 
-    Two paths, and the fast one is only taken on a PROVEN prefix:
+    Only rows NOT positively verified against `parsed` are deleted and
+    rewritten; see `_plan_message_write` for the modes (insert, unchanged,
+    append, suffix, replace).
 
-    - APPEND: stored messages are a verified prefix of `parsed` (see
-      `_append_only_from`) — insert only the new tail, no DELETE.
-    - REPLACE: anything else — DELETE + INSERT in a transaction, as before.
-
-    The DELETE is gated by _assert_same_source(): it can only ever remove
-    messages that came from the very file being re-ingested.
+    Every DELETE is gated by _assert_same_source(), which runs first on every
+    path: it can only ever remove messages that came from the very file being
+    re-ingested.
     """
     with conn.cursor() as cur:
         # Find existing conversation
@@ -303,17 +300,28 @@ def upsert_conversation(
         )
         existing = cur.fetchone()
 
-        append_from = None
+        mode, keep = "insert", 0
         if existing:
             conv_id, stored_source = existing
-            # Fail closed BEFORE any destructive statement runs. Unchanged, and
-            # it still runs first on the append path — a source collision must
-            # be refused whether or not we were going to delete anything.
+            # Fail closed BEFORE any destructive statement runs, on every path —
+            # a source collision must be refused whether or not we were going to
+            # delete anything.
             _assert_same_source(stored_source, source_file, parsed.session_id)
-            append_from = _append_only_from(cur, conv_id, parsed)
-            if append_from is None:
-                # Delete old messages (CASCADE would do this, but explicit is clearer)
+            cur.execute(
+                "SELECT sequence_num, uuid, content_hash FROM messages WHERE conversation_id = %s",
+                (conv_id,),
+            )
+            mode, keep = _plan_message_write(cur.fetchall(), parsed.messages)
+            if mode == "replace":
                 cur.execute("DELETE FROM messages WHERE conversation_id = %s", (conv_id,))
+            elif mode == "suffix":
+                # Rows below `keep` were verified one by one; the planner refuses
+                # NULL and duplicate sequence numbers, so this removes exactly
+                # every row that was not.
+                cur.execute(
+                    "DELETE FROM messages WHERE conversation_id = %s AND sequence_num >= %s",
+                    (conv_id, keep),
+                )
             # Update conversation metadata
             cur.execute(
                 """UPDATE conversations SET
@@ -348,11 +356,8 @@ def upsert_conversation(
             conv_id = cur.fetchone()[0]
 
         # Batch insert messages (execute_values is ~100x faster than individual INSERTs).
-        # On the append path only the new tail is written; on the replace path
-        # everything was just deleted, so this writes the whole conversation.
-        to_write = parsed.messages
-        if append_from is not None:
-            to_write = [m for m in parsed.messages if m.sequence_num > append_from]
+        # Everything at or after `keep` was just deleted (or never existed).
+        to_write = [m for m in parsed.messages if m.sequence_num >= keep]
 
         rows = []
         for msg in to_write:
@@ -378,12 +383,19 @@ def upsert_conversation(
             )
 
     conn.commit()
-    # Say WHICH path ran and how many rows it actually wrote. Without this an
-    # append and a full rewrite are indistinguishable in the log, and the whole
-    # point of the change is the difference between them.
-    mode = f"appended {len(rows)}" if append_from is not None else f"replaced {len(rows)}"
+    # Say WHICH path ran and how many rows it actually wrote. Without this the
+    # paths are indistinguishable in the log, and WAL volume is the difference
+    # between them. A new conversation says "inserted", not "replaced": it used
+    # to say "replaced", which made first ingests look like rewrites.
+    label = {
+        "insert": f"inserted {len(rows)}",
+        "unchanged": "unchanged 0",
+        "append": f"appended {len(rows)}",
+        "suffix": f"rewrote suffix from seq {keep}: {len(rows)}",
+        "replace": f"replaced {len(rows)}",
+    }[mode]
     logger.info(
         f"Upserted conversation {parsed.session_id}: "
-        f"{parsed.message_count} messages ({mode})"
+        f"{parsed.message_count} messages ({label})"
     )
     return conv_id
